@@ -1,4 +1,6 @@
 import os
+import argparse
+import math
 from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 import torch
@@ -9,6 +11,7 @@ from pyquaternion import Quaternion
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.utils.data_classes import Box
+from nuscenes.map_expansion.map_api import NuScenesMap
 
 
 class AugConfig:
@@ -280,3 +283,74 @@ class NuscData(Dataset):
             "grid": self.grid_data,
             "token": token,
         }
+
+def main():
+    dataroot = "/Users/umair/BEV/mini"
+    version = "v1.0-mini"
+
+    print("[INFO] Loading NuScenes dataset...")
+    nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
+
+    # --- Use your grid spec ---
+    grid_conf = GridConfig()
+    grid_data = grid_conf.gen_dx_bx()
+    dx, dy = float(grid_data["dx"][0]), float(grid_data["dx"][1])   #(0.5m, 0.5m)
+    bx, by = float(grid_data["bx"][0]), float(grid_data["bx"][1])   # (-50m, -50m)
+    nx, ny = int(grid_data["nx"][0]),  int(grid_data["nx"][1])      # (200, 200)
+
+    # Patch size in meters to match the BEV grid exactly.
+    w = dx * nx  # along x
+    h = dy * ny  # along y
+
+    # --- pick a scene + map ---
+    scene_idx = 0
+    scene = nusc.scene[scene_idx]
+    log = nusc.get("log", scene["log_token"])
+    map_name = log["location"]
+    print(f"[INFO] Using scene: {scene['name']}")
+    print(f"[INFO] Map name: {map_name}")
+
+    nusc_map = NuScenesMap(dataroot=dataroot, map_name=map_name)
+    explorer = nusc_map.explorer
+
+    # --- anchor patch at the first ego pose of the scene ---
+    first_sample = nusc.get("sample", scene["first_sample_token"])
+    sd_token = first_sample["data"].get("LIDAR_TOP") or next(iter(first_sample["data"].values()))
+    sd = nusc.get("sample_data", sd_token)
+    ego_pose = nusc.get("ego_pose", sd["ego_pose_token"])
+
+    cx, cy, _ = ego_pose["translation"]
+    q = Quaternion(ego_pose["rotation"])
+    R = q.rotation_matrix.astype(float)
+
+    # yaw in degrees around +Z (north-facing is 0 deg; positive = CCW)
+    yaw_deg = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+
+    # --- Rasterize drivable area directly into your BEV grid shape ---
+    patch_box = (cx, cy, h, w)   # (x_center, y_center, height_m, width_m)
+    canvas_size = (ny, nx)                       # (H, W) pixels -> matches your BEV grid
+
+    print("[INFO] Rasterizing drivable area mask aligned to BEV grid...")
+    # Returns array [C, H, W]; C = 1 for single layer.
+    mask_chw = explorer.get_map_mask(
+        patch_box=patch_box,
+        patch_angle=yaw_deg,                # ego-forward up; use 0 for north-up
+        layer_names=['drivable_area'],
+        canvas_size=canvas_size
+    )
+
+    # (H, W) binary -> uint8 0/255
+    mask_hw = (mask_chw[0] > 0).astype(np.uint8) * 255
+
+    # Save for a quick visual check (row=y, col=x)
+    out_path = os.path.join(os.getcwd(), "drivable_area_mask_bev.png")
+    Image.fromarray(mask_hw).save(out_path)
+    print(f"[DONE] Saved drivable area mask: {out_path}")
+    print(f"[INFO] Mask shape (H, W): {mask_hw.shape}  | dx,dy=({dx},{dy})  | bx,by=({bx},{by})  | yaw_deg={yaw_deg:.2f}")
+
+    # If you want a torch tensor shaped (1, ny, nx) ready for your pipeline:
+    drivable_tensor = torch.from_numpy(mask_hw.astype(np.float32) / 255.0).unsqueeze(0)  # (1, ny, nx)
+
+    # Example: package like your labels dict style
+    targets = {"drivable": drivable_tensor}  # (1, ny, nx)
+    # You can return / use `targets` as needed.
