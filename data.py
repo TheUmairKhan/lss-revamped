@@ -328,7 +328,7 @@ def main():
 
     # --- Rasterize drivable area directly into your BEV grid shape ---
     patch_box = (cx, cy, h, w)   # (x_center, y_center, height_m, width_m)
-    canvas_size = (ny, nx)                       # (H, W) pixels -> matches your BEV grid
+    canvas_size = (ny, nx)       # (H, W) pixels -> matches your BEV grid
 
     print("[INFO] Rasterizing drivable area mask aligned to BEV grid...")
     # Returns array [C, H, W]; C = 1 for single layer.
@@ -341,16 +341,15 @@ def main():
 
     # (H, W) binary -> uint8 0/255
     mask_hw = (mask_chw[0] > 0).astype(np.uint8) * 255
+    mask_hw = np.flipud(mask_hw)
 
-    # Save for a quick visual check (row=y, col=x)
     out_path = os.path.join(os.getcwd(), "drivable_area_mask_bev.png")
     Image.fromarray(mask_hw).save(out_path)
     print(f"[DONE] Saved drivable area mask: {out_path}")
     print(f"[INFO] Mask shape (H, W): {mask_hw.shape}  | dx,dy=({dx},{dy})  | bx,by=({bx},{by})  | yaw_deg={yaw_deg:.2f}")
 
-    # If you want a torch tensor shaped (1, ny, nx) ready for your pipeline:
     drivable_tensor = torch.from_numpy(mask_hw.astype(np.float32) / 255.0).unsqueeze(0)  # (1, ny, nx)
-
-    # Example: package like your labels dict style
     targets = {"drivable": drivable_tensor}  # (1, ny, nx)
-    # You can return / use `targets` as needed.
+
+if __name__ == '__main__':
+    main()
