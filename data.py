@@ -225,9 +225,54 @@ class NuscData(Dataset):
         return imgs, rots, trans, intrins, post_rots, post_trans
 
     # ---------------------------- labels ----------------------------
+    
+    def drivable_area(self, sample: Dict[str, Any]) -> torch.Tensor:
+        """
+        Return (1, ny, nx) drivable-area mask aligned to ego and to our BEV grid indexing.
+        - Centered at ego pose of this sample.
+        - Physical size matches (dx*nx, dy*ny).
+        - Orientation uses north-referenced angle (as NuScenes expects).
+        - Vertically flipped to match occ's indexing (forward = down).
+        """
+        dx, dy = self.dx[0], self.dx[1]
+        nx, ny = self.nx[0], self.nx[1]
+        w, h = dx * nx, dy * ny # width (x), height (y) in meters
 
-    def make_targets(self, sample: Dict[str, Any], T_global2ego: np.ndarray) -> Dict[str, torch.Tensor]:
-        """Return {'occ': (1, ny, nx)} vehicle occupancy in ego BEV."""
+        # Figure out which map this sample belongs to
+        scene = self.nusc.get("scene", sample["scene_token"])
+        log = self.nusc.get("log", scene["log_token"])
+        map_name = log["location"]
+        nusc_map = NuScenesMap(dataroot=self.dataroot, map_name=map_name)
+        explorer = nusc_map.explorer
+
+        # Ego Pose
+        lidar_tok = sample["data"].get("LIDAR_TOP") or next(iter(sample["data"].values()))
+        sd = self.nusc.get("sample_data", lidar_tok)
+        ep = self.nusc.get("ego_pose", sd["ego_pose_token"])
+        cx, cy, _ = ep["translation"]
+        R = Quaternion(ep["rotation"]).rotation_matrix.astype(float)
+
+        patch_angle = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+
+        # Rasterize into our BEV shape
+        patch_box = (cx, cy, h, w)           # (center_x, center_y, height_m, width_m)
+        canvas_size = (ny, nx)               # (H, W)
+        mask_chw = explorer.get_map_mask(
+            patch_box=patch_box,
+            patch_angle=patch_angle,
+            layer_names=['drivable_area'],
+            canvas_size=canvas_size
+        )  # shape (1, ny, nx)
+
+        mask = (mask_chw[0] > 0).astype(np.uint8)
+
+        return torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)  # (1, ny, nx)
+
+
+    def vehicle_occ(self, sample: Dict[str, Any], T_global2ego: np.ndarray) -> torch.Tensor:
+        """
+        Vehicle occupancy in ego BEV. Shape: (1, ny, nx). Matches your original logic.
+        """
         dx, dy = self.dx[0], self.dx[1]
         bx, by = self.bx[0], self.bx[1]
         nx, ny = self.nx[0], self.nx[1]
@@ -235,20 +280,20 @@ class NuscData(Dataset):
         occ = np.zeros((ny, nx), dtype=np.uint8)
 
         R_ge = self._project_to_so3(T_global2ego[:3, :3])
-        t_ge = T_global2ego[:3,  3]
+        t_ge = T_global2ego[:3, 3]
 
         for ann_tok in sample["anns"]:
             ann = self.nusc.get("sample_annotation", ann_tok)
             if not ann["category_name"].startswith("vehicle."):
                 continue
 
-            # global -> ego (rotate then translate)
+            # global -> ego
             box = Box(ann["translation"], ann["size"], Quaternion(ann["rotation"]))
             box.rotate(Quaternion(matrix=R_ge))
             box.translate(t_ge)
 
             # ground-plane corners -> grid indices
-            corners = box.bottom_corners()[:2, :].T.astype(np.float32)    # (4,2) in meters
+            corners = box.bottom_corners()[:2, :].T.astype(np.float32)  # (4,2)
             ix = np.floor((corners[:, 0] - bx) / dx + 0.5).astype(np.int32)
             iy = np.floor((corners[:, 1] - by) / dy + 0.5).astype(np.int32)
             ix = np.clip(ix, 0, nx - 1)
@@ -258,7 +303,14 @@ class NuscData(Dataset):
             if poly.shape[0] >= 3:
                 cv2.fillPoly(occ, [poly], 1)
 
-        return {"occ": torch.from_numpy(occ.astype(np.float32)).unsqueeze(0)}
+        return torch.from_numpy(occ.astype(np.float32)).unsqueeze(0)  # (1, ny, nx)
+
+
+    def make_targets(self, sample: Dict[str, Any], T_global2ego: np.ndarray) -> Dict[str, torch.Tensor]:
+        return {
+        "occ": self.make_vehicle_occ(sample, T_global2ego),  # (1, ny, nx)
+        "drivable": self.drivable_area(sample)               # (1, ny, nx)
+        }
 
     # ---------------------------- item ----------------------------
 
@@ -284,6 +336,19 @@ class NuscData(Dataset):
             "token": token,
         }
 
+
+# --- build a tiny helper to compose drivable+vehicles ---
+def compose_bev(drivable_01: np.ndarray, occ_01: np.ndarray) -> np.ndarray:
+    """
+    Inputs: drivable_01, occ_01 are (H,W) in {0,1}.
+    Output: (H,W) uint8 image — 0=black, 110=drivable, 255=vehicles.
+    Vehicles overwrite drivable.
+    """
+    bev = np.zeros_like(drivable_01, dtype=np.uint8)
+    bev[drivable_01 > 0] = 110
+    bev[occ_01 > 0] = 255
+    return bev
+
 def main():
     dataroot = "/Users/umair/BEV/mini"
     version = "v1.0-mini"
@@ -291,65 +356,42 @@ def main():
     print("[INFO] Loading NuScenes dataset...")
     nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
 
-    # --- Use your grid spec ---
     grid_conf = GridConfig()
-    grid_data = grid_conf.gen_dx_bx()
-    dx, dy = float(grid_data["dx"][0]), float(grid_data["dx"][1])   #(0.5m, 0.5m)
-    bx, by = float(grid_data["bx"][0]), float(grid_data["bx"][1])   # (-50m, -50m)
-    nx, ny = int(grid_data["nx"][0]),  int(grid_data["nx"][1])      # (200, 200)
-
-    # Patch size in meters to match the BEV grid exactly.
-    w = dx * nx  # along x
-    h = dy * ny  # along y
-
-    # --- pick a scene + map ---
-    scene_idx = 0
-    scene = nusc.scene[scene_idx]
-    log = nusc.get("log", scene["log_token"])
-    map_name = log["location"]
-    print(f"[INFO] Using scene: {scene['name']}")
-    print(f"[INFO] Map name: {map_name}")
-
-    nusc_map = NuScenesMap(dataroot=dataroot, map_name=map_name)
-    explorer = nusc_map.explorer
-
-    # --- anchor patch at the first ego pose of the scene ---
-    first_sample = nusc.get("sample", scene["first_sample_token"])
-    sd_token = first_sample["data"].get("LIDAR_TOP") or next(iter(first_sample["data"].values()))
-    sd = nusc.get("sample_data", sd_token)
-    ego_pose = nusc.get("ego_pose", sd["ego_pose_token"])
-
-    cx, cy, _ = ego_pose["translation"]
-    q = Quaternion(ego_pose["rotation"])
-    R = q.rotation_matrix.astype(float)
-
-    # yaw in degrees around +Z (north-facing is 0 deg; positive = CCW)
-    yaw_deg = math.degrees(math.atan2(R[1, 0], R[0, 0]))
-
-    # --- Rasterize drivable area directly into your BEV grid shape ---
-    patch_box = (cx, cy, h, w)   # (x_center, y_center, height_m, width_m)
-    canvas_size = (ny, nx)       # (H, W) pixels -> matches your BEV grid
-
-    print("[INFO] Rasterizing drivable area mask aligned to BEV grid...")
-    # Returns array [C, H, W]; C = 1 for single layer.
-    mask_chw = explorer.get_map_mask(
-        patch_box=patch_box,
-        patch_angle=yaw_deg,                # ego-forward up; use 0 for north-up
-        layer_names=['drivable_area'],
-        canvas_size=canvas_size
+    aug_conf  = AugConfig()
+    ds = NuscData(
+        nusc=nusc,
+        dataroot=dataroot,
+        version=version,
+        split="train",
+        grid_conf=grid_conf,
+        aug_conf=aug_conf,
     )
 
-    # (H, W) binary -> uint8 0/255
-    mask_hw = (mask_chw[0] > 0).astype(np.uint8) * 255
-    mask_hw = np.flipud(mask_hw)
+    scene_idx = 0
+    scene = nusc.scene[scene_idx]
+    sample = nusc.get("sample", scene["first_sample_token"])
 
-    out_path = os.path.join(os.getcwd(), "drivable_area_mask_bev.png")
-    Image.fromarray(mask_hw).save(out_path)
-    print(f"[DONE] Saved drivable area mask: {out_path}")
-    print(f"[INFO] Mask shape (H, W): {mask_hw.shape}  | dx,dy=({dx},{dy})  | bx,by=({bx},{by})  | yaw_deg={yaw_deg:.2f}")
+    # Ego transform for occupancy.
+    T_global2ego = ds._global2ego(sample)
 
-    drivable_tensor = torch.from_numpy(mask_hw.astype(np.float32) / 255.0).unsqueeze(0)  # (1, ny, nx)
-    targets = {"drivable": drivable_tensor}  # (1, ny, nx)
+    # --- Get labels ---
+    occ_t = ds.vehicle_occ(sample, T_global2ego)   # (1, ny, nx) float {0,1}
+    drv_t = ds.drivable_area(sample)               # (1, ny, nx) float {0,1}
+
+    # To numpy (H, W) in {0,1}.
+    occ = (occ_t.squeeze(0).numpy() > 0.5).astype(np.uint8)
+    drv = (drv_t.squeeze(0).numpy() > 0.5).astype(np.uint8)
+
+    # black=notihing, gray=drivable, white=vehicles.
+    bev_img = compose_bev(drv, occ)
+
+    # ego marker.
+    cy, cx = bev_img.shape[0] // 2, bev_img.shape[1] // 2
+    bev_img[max(cy-1,0):cy+2, max(cx-1,0):cx+2] = 200
+
+    out_path = os.path.join(os.getcwd(), "bev_drivable_plus_vehicles.png")
+    Image.fromarray(bev_img).save(out_path)
+    print(f"[DONE] Saved fused BEV: {out_path}")
 
 if __name__ == '__main__':
     main()
