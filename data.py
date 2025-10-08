@@ -199,6 +199,11 @@ class NuscData(Dataset):
             im = np.asarray(im, dtype=np.float32) / 255.0
             im = torch.from_numpy(im).permute(2, 0, 1).contiguous()  # (3,H,W)
 
+            # EfficientNet normalization for backbone
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=im.dtype, device=im.device).view(3,1,1)
+            std  = torch.tensor([0.229, 0.224, 0.225], dtype=im.dtype, device=im.device).view(3,1,1)
+            im = (im - mean) / std
+
             sx, sy = W / float(W0), H / float(H0)
             S = np.array([[sx, 0, 0],
                           [0,  sy, 0],
