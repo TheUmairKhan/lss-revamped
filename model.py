@@ -262,6 +262,18 @@ class QuickCumSum(torch.autograd.Function):
 
 
 def voxelize(pts_ego, dx, bx, nx):
+    """
+    Convert continuous 3D ego-frame points into discrete voxel indices.
+    Inputs:
+      pts_ego: [B, N, D, H, W, 3] point cloud in ego coordinates
+      dx: [3] voxel size (meters per cell)
+      bx: [3] voxel grid lower bounds
+      nx: [3] voxel grid dimensions (X, Y, Z)
+    Returns:
+      voxel_mask: [B, M] valid-point mask within grid bounds
+      vox_idx: [K, 3] integer voxel indices for valid points
+      batch_ix: [K] batch IDs for each valid point
+    """
     B, N, D, H, W, _ = pts_ego.shape
     M = N * D * H * W
     device = pts_ego.device
@@ -345,33 +357,15 @@ def voxel_pool(feats_ends_mask, vox_idx, batch_ix, nx, B):
     rank_sorted   = rank[order] # [K]
     feats_sorted = feats_ends_mask[order] # [K, C]
 
-    # Segment starts: True when new voxel id begins
-    starts = torch.ones_like(rank_sorted, dtype=torch.bool, device=device)
-    starts[1:] = rank_sorted[1:] != rank_sorted[:-1]
+    seg_sum, ends_mask = QuickCumSum.apply(feats_sorted, rank_sorted) # [S,C], [K]bool
+    rank_unique = rank_sorted[ends_mask] # [S]
 
-    # Indices of segment starts and ends (ends are starts of next seg minus 1)
-    start_idx = torch.nonzero(starts, as_tuple=False).squeeze(1) # [S]
-    end_idx = start_idx.clone()
-    end_idx[:-1] = start_idx[1:] - 1
-    end_idx[-1] = K - 1  # [S]
-
-    # Cumulative sum over sorted features
-    cs = torch.cumsum(feats_sorted, dim=0) # [K, C]
-
-    # Segment sums: cs[end] - cs[prev_end]
-    seg_sum = cs[end_idx].clone() # [S, C]
-    if seg_sum.size(0) > 1:
-        seg_sum[1:] -= cs[end_idx[:-1]]  # subtract prev segment end cs
-    
-    rank_unique = rank_sorted[end_idx] # [S, C]
-
-    # Write once per voxel (no atomics)
     bev_flat = feats_ends_mask.new_zeros((B * Z * X * Y, C), device=device)
     bev_flat[rank_unique] = seg_sum
 
-    # Reshape → [B, C*Z, X, Y]
-    bev_5d = bev_flat.view(B, Z, X, Y, C)                           # [B,Z,X,Y,C]
-    bev_ch_first = bev_5d.permute(0, 4, 1, 2, 3).contiguous()       # [B,C,Z,X,Y]
-    bev = bev_ch_first.view(B, C * Z, X, Y)                         # [B,C*Z,X,Y]
+    # reshape → [B, C*Z, X, Y]
+    bev_5d = bev_flat.view(B, Z, X, Y, C)                 # [B,Z,X,Y,C]
+    bev = bev_5d.permute(0, 4, 1, 2, 3).contiguous()      # [B,C,Z,X,Y]
+    bev = bev.view(B, C * Z, X, Y)                        # [B,C*Z,X,Y]
     return bev
 
