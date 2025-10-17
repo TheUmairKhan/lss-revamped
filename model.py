@@ -1,3 +1,4 @@
+from turtle import forward
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -209,3 +210,168 @@ class Lift(nn.Module):
 
         pts_ego = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
         return depth_prob, cam_feats, pts_ego
+
+
+class QuickCumSum(torch.autograd.Function):
+    """
+    Segment-wise accumulation using the cumsum trick.
+    Inputs:
+      x: [K, C] feature tensor sorted by segment/voxel ID
+      ranks: [K] int tensor of segment IDs (non-decreasing)
+    Returns:
+      seg_sum: [S, C] summed features per unique segment (voxel)
+      ends_mask: [K] bool mask marking the last element of each segment
+    """ 
+    @staticmethod
+    def forward(ctx, x, ranks):
+        K = x.shape[0]
+        device = x.device
+        dtype = x.dtype
+
+        if K == 0:
+            ends_mask = torch.zeros((0,), dtype=torch.bool, device=device)
+            seg_sum = x
+            ctx.save_for_backward(ends_mask)
+            return seg_sum, ends_mask
+        
+        cs = torch.cumsum(x, dim=0) # [K, C]
+        ends_mask = torch.ones(K, dtype=torch.bool)
+        ends_mask[:-1] = ranks[1:] != ranks[:-1]
+
+        seg_sum = cs[ends_mask].clone() # [S, C]
+        if seg_sum.shape[0] > 1:
+            seg_sum[1:] -= cs[ends_mask.nonzero(as_tuple=False).squeeze(1)[:-1]]  # prev ends
+        ctx.save_for_backward(ends_mask)
+        
+        return seg_sum, ends_mask
+
+
+    @staticmethod
+    def backward(ctx, grad_seg_sum, grad_ends_mask):
+        """
+        grad_seg_sum: [S, C]
+        grad_ends_mask:    None (bool mask, no grads)
+        We need to expand grad_seg_sum back to shape [K, C] so every row in a
+        segment receives the SAME gradient as its segment-sum.
+        """
+        ends_mask, = ctx.saved_tensors
+        back = torch.cumsum(ends_mask.to(torch.int64), dim=0)
+        back[ends_mask] -= 1
+        grad_x  = grad_seg_sum.index_select(0, back)
+        return grad_x, None, None
+
+
+def voxelize(pts_ego, dx, bx, nx):
+    B, N, D, H, W, _ = pts_ego.shape
+    M = N * D * H * W
+    device = pts_ego.device
+    G = pts_ego.view(B, M, 3) # [B, M, 3]
+
+    # broadcast dx, bx to correct shape
+    dx = dx.to(G).view(1, 1, 3)
+    bx = bx.to(G).view(1, 1, 3)
+
+    # continuous → discrete voxel indices
+    vox = torch.floor((G - (bx - dx / 2.0)) / dx).long()  # [B, M, 3]
+
+    # Mask ensuring points lie inside voxel grid
+    in_x = (vox[..., 0] >= 0) & (vox[..., 0] < nx[0])
+    in_y = (vox[..., 1] >= 0) & (vox[..., 1] < nx[1])
+    in_z = (vox[..., 2] >= 0) & (vox[..., 2] < nx[2])
+    voxel_mask = in_x & in_y & in_z  # [B, M]
+
+    # flatten across batch
+    vox_flat   = vox.view(-1, 3)            # [B*M, 3]
+    mask_flat  = voxel_mask.view(-1)        # [B*M]
+    batch_ix   = torch.arange(B, device=device).repeat_interleave(M)  # [B*M]
+
+    # apply mask in one shot
+    vox_idx  = vox_flat[mask_flat]          # [K, 3]
+    batch_ix = batch_ix[mask_flat]          # [K]
+
+    return voxel_mask, vox_idx, batch_ix
+
+
+def gather_feats(cam_feats, voxel_mask):
+    """
+    Args:
+      cam_feats:  [B, N, D, h, w, C]
+      voxel_mask: [B, M] boolean, M = N*D*h*w (must be computed from the SAME pts_ego)
+    Returns:
+      feats_ends_mask: [K, C]  (features for ends_mask points, aligned with vox_idx/batch_ix)
+    """
+    B, N, D, h, w, C = cam_feats.shape
+    M = N * D * h * w
+
+    feats_flat = cam_feats.view(B, M, C)
+    mask_flat = voxel_mask.view(B * M)
+
+    return feats_flat.view(B * M, C)[mask_flat]  # [K, C]
+
+
+def make_voxel_index(vox_idx, batch_ix, nx, B):
+    """
+    Map (b, ix, iy, iz) → a single linear index over [0 .. B*Z*X*Y).
+    nx: [3] -> (X, Y, Z)
+    """
+    X, Y, Z = int(nx[0]), int(nx[1]), int(nx[2])
+    rank = (((batch_ix * Z + vox_idx[:, 2]) * X + vox_idx[:, 0]) * Y + vox_idx[:, 1])
+    return rank, X, Y, Z
+
+def voxel_pool(feats_ends_mask, vox_idx, batch_ix, nx, B):
+    """
+    Sum-pool ends_mask point features into a BEV grid.
+
+    Inputs:
+      feats_ends_mask: [K, C]   (from gather_feats)
+      vox_idx:    [K, 3]   (ix, iy, iz) for each ends_mask point
+      batch_ix:   [K]      batch id for each ends_mask point
+      nx:         [3]      (X, Y, Z)
+      B:          int
+
+    Returns:
+      bev: [B, C*Z, X, Y]
+    """
+    if feats_ends_mask.numel() == 0:
+        C = feats_ends_mask.shape[-1] if feats_ends_mask.ndim == 2 else 0
+        X, Y, Z = int(nx[0]), int(nx[1]), int(nx[2])
+        return feats_ends_mask.new_zeros((B, C * Z, X, Y))
+    
+    K, C = feats_ends_mask.shape
+    device = feats_ends_mask.device
+    rank, X, Y, Z = make_voxel_index(vox_idx, batch_ix, nx, B)
+
+    order = rank.argsort()
+    rank_sorted   = rank[order] # [K]
+    feats_sorted = feats_ends_mask[order] # [K, C]
+
+    # Segment starts: True when new voxel id begins
+    starts = torch.ones_like(rank_sorted, dtype=torch.bool, device=device)
+    starts[1:] = rank_sorted[1:] != rank_sorted[:-1]
+
+    # Indices of segment starts and ends (ends are starts of next seg minus 1)
+    start_idx = torch.nonzero(starts, as_tuple=False).squeeze(1) # [S]
+    end_idx = start_idx.clone()
+    end_idx[:-1] = start_idx[1:] - 1
+    end_idx[-1] = K - 1  # [S]
+
+    # Cumulative sum over sorted features
+    cs = torch.cumsum(feats_sorted, dim=0) # [K, C]
+
+    # Segment sums: cs[end] - cs[prev_end]
+    seg_sum = cs[end_idx].clone() # [S, C]
+    if seg_sum.size(0) > 1:
+        seg_sum[1:] -= cs[end_idx[:-1]]  # subtract prev segment end cs
+    
+    rank_unique = rank_sorted[end_idx] # [S, C]
+
+    # Write once per voxel (no atomics)
+    bev_flat = feats_ends_mask.new_zeros((B * Z * X * Y, C), device=device)
+    bev_flat[rank_unique] = seg_sum
+
+    # Reshape → [B, C*Z, X, Y]
+    bev_5d = bev_flat.view(B, Z, X, Y, C)                           # [B,Z,X,Y,C]
+    bev_ch_first = bev_5d.permute(0, 4, 1, 2, 3).contiguous()       # [B,C,Z,X,Y]
+    bev = bev_ch_first.view(B, C * Z, X, Y)                         # [B,C*Z,X,Y]
+    return bev
+
